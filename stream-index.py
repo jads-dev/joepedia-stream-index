@@ -122,7 +122,7 @@ if __name__ == "__main__":
             f"""{WARNING}
 <div style="display: flex; justify-content: center;">
 {{| class="wikitable"
-  |+ style="caption-side:bottom;"|This data is sourced from a spreadsheet maintained by Falco.<ref>[{DATA_SOURCE}|Falco's Spreadsheet of Joe content].</ref>, processed using a script originally written by JayUplink.<ref>[{SCRIPT} “joepedia-stream-index” on GitHub].</ref>
+  |+ style="caption-side:bottom;"|This data is sourced from a spreadsheet maintained {{{{Attribution|Falco}}}}.<ref>[{DATA_SOURCE}|Falco's Spreadsheet of Joe content].</ref>, processed using a script originally written {{{{Attribution|JayUplink}}}}.<ref>[{SCRIPT} “joepedia-stream-index” on GitHub].</ref>
   |-
   ! # !! Date !! Game !! No. in Series !! Available VODs
 """
