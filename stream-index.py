@@ -9,27 +9,43 @@ Options:
                          from, if downloading the data this will be written
                          to with the new data. [default: Joe - Streams.csv]
     -o --output OUT|-    The file to write to with the output wikitext.
+                         Use - to print to the console.
                          [default: stream-index.txt]
     --overwrite-output   Allow overwriting the output wiki file.
     -d --download        Try to download the latest data from the spreadsheet,
-                         requires a google API key from the GOOGLE_API_KEY
-                         environment variable and the googleapiclient library
-                         installed.
+                         requires an API key is set and the googleapiclient
+                         library is installed.
     --overwrite-input    Allow overwriting the input CSV file if downloading.
+    -u --update-wiki     Update the wiki page with the new output automatically.
+                         Requires the pwiki library is installed.
+    -q --quiet           Doesn't give output unless there is a problem, this
+                         is implied if you output to stdout.
 
 Uncommon Options:
+    --google-api-key     The API key when downloading from google, if not
+                         set the value of the GOOGLE_API_KEY environment
+                         variable will be used.
     --spreadsheet-id ID  Specify the ID of the google spreadsheet to source the
                          data from, when downloading.
                          [default: 1ITQm2xYrVj7sycFsjwPSe8bbCFu3OJmPSGtzm3ZImRE]
     --skip-rows NUM      The number of rows to skip from the spreadsheet, to
-                         ignore headers.
-                         [default: 7]
+                         ignore headers. [default: 7]
     --colors FILE        The JSON file to load a list of colors from.
                          [default: colors.json]
     --replacements FILE  The JSON file to load a list of text replacements from.
                          [default: replacements.json]
     --additional FILE    The JSON file to load a list of additional stream data
                          from. [default: additional_stream_data.json]
+    --dry-run            Don't actually update the wiki, just show the output
+                         for testing.
+    --bot-name NAME      The name of the bot for updating
+                         mediawiki. [default: joepedia-stream-index-bot]
+    --bot-user USER      The user providing the bot password for updating
+                         mediawiki, if not set the value of the
+                         MEDIAWIKI_BOT_USER environment variable will be used.
+    --bot-password PASS  The bot password for updating mediawiki, if not set
+                         the value of the MEDIAWIKI_BOT_PASSWORD environment
+                         variable will be used.
 
 """
 
@@ -37,13 +53,10 @@ import csv
 import itertools
 import json
 import os
-import random
 import sys
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from datetime import datetime
-
-from docopt import docopt
 
 # Where this script can be found.
 SCRIPT = "https://github.com/jads-dev/joepedia-stream-index"
@@ -58,6 +71,9 @@ WARNING = [
     "  script, or modify the StreamIndexEntry template instead.",
     "-->",
 ]
+
+START_MARKER = "<!-- START GENERATED STREAM INDEX TABLE -->"
+END_MARKER = "<!-- END GENERATED STREAM INDEX TABLE -->"
 
 
 def wikify_link(key, link):
@@ -78,7 +94,8 @@ def obtain(file_id, api_key):
     from googleapiclient.discovery import build
 
     with build("drive", "v3", developerKey=api_key) as drive:
-        data = drive.files().export(fileId=file_id, mimeType="text/csv").execute()
+        export = drive.files().export(fileId=file_id, mimeType="text/csv")
+        data = export.execute()
         if not data:
             raise Exception("Could not obtain spreadsheet data.")
         else:
@@ -149,20 +166,39 @@ def as_template_argument(key, value):
         yield f"{key}={value}"
 
 
+def color_picker(colors):
+    max = len(colors)
+
+    def color_for_name(name):
+        return colors[hash(name) % max]
+
+    return color_for_name
+
+
 def generate_wiki_source(
     data_source_id,
     rows,
     colors,
 ):
     data_source_url = f"https://docs.google.com/spreadsheets/d/{data_source_id}"
-    data_attribution = f"sourced from a spreadsheet maintained {{{{Attribution|Falco}}}}<ref>[{data_source_url} Falco’s Spreadsheet of Joe content].</ref>"
-    script_attribution = f"and processed using a script originally written {{{{Attribution|JayUplink}}}}<ref>[{SCRIPT} “joepedia-stream-index” on GitHub].</ref>"
+    data_attribution = (
+        "sourced from a spreadsheet maintained {{Attribution|Falco}}"
+        f"<ref>[{data_source_url} Falco’s Spreadsheet of Joe content].</ref>"
+    )
+    script_attribution = (
+        "and processed using a script originally written "
+        "{{Attribution|JayUplink}}"
+        f"<ref>[{SCRIPT} “joepedia-stream-index” on GitHub].</ref>"
+    )
     attributions = ", ".join([data_attribution, script_attribution])
 
     multipart = {row["index"] for row in rows if row["part"] > 1}
 
-    games = {row["game"]: random.choice(colors) for row in rows}
+    color_for_name = color_picker(colors)
 
+    games = {row["game"]: color_for_name(row["game"]) for row in rows}
+
+    yield START_MARKER
     yield from WARNING
     yield """<div style="display: flex; justify-content: center;">"""
     yield """{| class="wikitable" """
@@ -197,7 +233,7 @@ def generate_wiki_source(
     yield "|}"
     yield "</div>"
     yield from WARNING
-    yield ""
+    yield END_MARKER
 
 
 @contextmanager
@@ -206,36 +242,101 @@ def open_overwrite(file, arguments, overwrite_arg_name):
         yield open(file, "w" if arguments[overwrite_arg_name] else "x")
     except FileExistsError:
         print(
-            f"Error: The file “{file}” already exists, use the “{overwrite_arg_name}” argument if you wish to overwrite it.",
+            f"Error: The file “{file}” already exists, use the "
+            f"“{overwrite_arg_name}” argument if you wish to overwrite it.",
             file=sys.stderr,
         )
         sys.exit(2)
 
 
+def open_json(arguments, file_arg_name):
+    filename = arguments[file_arg_name]
+    try:
+        with open(filename, "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        print(
+            f"Error: The file “{filename}” does not exists, use the "
+            f"“{file_arg_name}” argument if you wish to change what file to "
+            "use.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
+def update_wiki_page(
+    name, user, password, page_name, wiki_text, reason, dry_run, quiet
+):
+    from pwiki.wiki import Wiki
+
+    wiki = Wiki(
+        "wiki.jads.stream",
+        f"{user}@{name}",
+        password,
+        None,
+        "https://wiki.jads.stream/api.php",
+    )
+
+    old_text = wiki.page_text(page_name)
+    before, start_marker, rest = old_text.partition(START_MARKER)
+    if not start_marker:
+        raise Exception(
+            f"Could not find the old table start marker (“{START_MARKER}”) on the page."
+        )
+    _old_table, end_marker, after = old_text.partition(END_MARKER)
+    if not end_marker:
+        raise Exception(
+            f"Could not find the old table start marker (“{START_MARKER}”) on the page."
+        )
+    new_text = f"{before}{wiki_text}{after}"
+
+    if old_text != new_text:
+        summary = f"{name}: Updated because {reason}."
+        if dry_run:
+            print(f"{name}: Dry run, not actually updating, would have edited to:")
+            print(new_text)
+        else:
+            wiki.edit(page_name, new_text, summary)
+            if not quiet:
+                print(summary)
+    else:
+        if not quiet:
+            print(f"{name}: Update tried because {reason}, but no changes needed.")
+
+
 if __name__ == "__main__":
+    from docopt import docopt
+
     arguments = docopt(__doc__)
 
     download = arguments["--download"]
     input_file = arguments["--input"]
     data_source_id = arguments["--spreadsheet-id"]
     output_file = arguments["--output"]
+    update_wiki = arguments["--update-wiki"]
 
-    with open(arguments["--replacements"], "r") as file:
-        replacements = json.load(file)
+    replacements = open_json(arguments, "--replacements")
+    colors = open_json(arguments, "--colors")
+    additional_stream_data = open_json(arguments, "--additional")
 
-    with open(arguments["--colors"], "r") as file:
-        colors = json.load(file)
-
-    with open(arguments["--additional"], "r") as file:
-        additional_stream_data = {
-            int(key): value for (key, value) in json.load(file).items()
-        }
+    quiet = arguments["--quiet"] or output_file == "-"
 
     if download:
-        api_key = os.environ.get("GOOGLE_API_KEY", None)
+        api_key = arguments["--google-api-key"] or os.environ.get(
+            "GOOGLE_API_KEY", None
+        )
+        if not api_key:
+            print(
+                "An API key must be provided with either “--google-api-key” or "
+                "the “GOOGLE_API_KEY” environment variable when downloading.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
         data = obtain(data_source_id, api_key)
         with open_overwrite(input_file, arguments, "--overwrite-input") as file:
             file.write(data)
+        if not quiet:
+            print(f"Written source data to “{input_file}”.")
 
     with open(input_file, "r") as file:
         rows = list(
@@ -247,11 +348,27 @@ if __name__ == "__main__":
             )
         )
 
-    wikitext = generate_wiki_source(data_source_id, rows, colors)
+    wikitext_lines = generate_wiki_source(data_source_id, rows, colors)
+    wikitext = "\n".join(wikitext_lines)
 
-    if output_file == "-":
-        for line in wikitext:
-            print(line)
+    if quiet:
+        print(wikitext)
     else:
+        print(f"Written wikitext to “{output_file}”.")
         with open_overwrite(output_file, arguments, "--overwrite-output") as file:
-            file.writelines(f"{line}\n" for line in wikitext)
+            file.write(f"{wikitext}\n")
+
+    if update_wiki:
+        update_wiki_page(
+            arguments["--bot-name"],
+            arguments["--bot-user"] or os.environ.get("MEDIAWIKI_BOT_USER"),
+            arguments["--bot-password"] or os.environ.get("MEDIAWIKI_BOT_PASSWORD"),
+            "Stream Index",
+            wikitext,
+            os.environ.get("UPDATE_REASON", "the script was manually run"),
+            arguments["--dry-run"],
+            quiet,
+        )
+
+    if not quiet:
+        print("Success")

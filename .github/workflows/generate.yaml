@@ -25,9 +25,12 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Generate wikitext.
-        run: python stream-index.py -d
+        run: python stream-index.py -d -u
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          MEDIAWIKI_BOT_USER: ${{ secrets.MEDIAWIKI_BOT_USER }}
+          MEDIAWIKI_BOT_PASSWORD: ${{ secrets.MEDIAWIKI_BOT_PASSWORD }}
+          UPDATE_REASON: ${{ github.event_name == 'push' && 'the script was updated' || 'of a scheduled update' }}
 
       - name: Upload generated wikitext.
         uses: actions/upload-artifact@v4
