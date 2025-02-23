@@ -1,0 +1,37 @@
+name: Generate
+
+on:
+  push:
+    branches: ["main"]
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  generate-wikitext:
+    name: Generate wikitext from spreadsheet data.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository.
+        uses: actions/checkout@v3
+
+      - name: Configure Python.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install Python dependencies.
+        run: pip install -r requirements.txt
+
+      - name: Generate wikitext.
+        run: python stream-index.py -d
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+      - name: Upload generated wikitext.
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-index
+          path: stream-index.txt
+          compression-level: 9

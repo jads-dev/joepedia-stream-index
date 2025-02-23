@@ -1,1 +1,4 @@
 *.csv
+stream-index.txt
+.ropeproject
+venv
