@@ -137,7 +137,7 @@ def read_and_standardise(file, skip_rows, replacements, additional_stream_data):
         if current_index < 300 and game == "Signalis":
             continue
 
-        additional = additional_stream_data.get(current_index, {})
+        additional = additional_stream_data.get(str(current_index), {})
 
         yield {
             "index": current_index,
