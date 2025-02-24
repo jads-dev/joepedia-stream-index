@@ -50,13 +50,16 @@ Uncommon Options:
 """
 
 import csv
+import hashlib
 import itertools
 import json
 import os
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
+from typing import IO
 
 # Where this script can be found.
 SCRIPT = "https://github.com/jads-dev/joepedia-stream-index"
@@ -72,25 +75,29 @@ WARNING = [
     "-->",
 ]
 
+# Markers that are used to find and replace the table in the wiki page.
 START_MARKER = "<!-- START GENERATED STREAM INDEX TABLE -->"
 END_MARKER = "<!-- END GENERATED STREAM INDEX TABLE -->"
 
 
-def wikify_link(key, link):
-    if not link:
-        return {}
-    link_with_protocol = link if link.startswith("https://") else f"https://{link}"
-    sanitised_link = link_with_protocol.replace("=", "&#61;")
-    return {key: f"{sanitised_link}"}
+# Add a protocol to a link if it is missing, and put it under the given key.
+def ensure_link_protocol(key: str, link: str):
+    return (
+        {key: link if link.startswith("https://") else f"https://{link}"}
+        if link
+        else {}
+    )
 
 
-def canonicalise(replacements, value):
+# Apply replacements to a string to ensure it uses canonical names.
+def canonicalise(replacements: Mapping[str, str], value: str):
     for target, replacement in replacements.items():
         value = value.replace(target, replacement)
     return value
 
 
-def obtain(file_id, api_key):
+# Obtain spreadsheet data using the google drive API.
+def obtain(file_id: str, api_key: str | None):
     from googleapiclient.discovery import build
 
     with build("drive", "v3", developerKey=api_key) as drive:
@@ -101,8 +108,66 @@ def obtain(file_id, api_key):
         else:
             return data.decode("utf-8")
 
+@dataclass
+class AdditionalRow:
+    guest: Sequence[str]
 
-def read_and_standardise(file, skip_rows, replacements, additional_stream_data):
+    def as_arguments(self) -> Iterable[tuple[str, None | str | Mapping[str, str] | Iterable[str]]]:
+        yield "guest", self.guest
+
+empty_additional_stream_row = AdditionalRow([])
+
+@dataclass
+class Row:
+    stream_index: int
+    date: str
+    part: int
+    game: str
+    game_index: int | None
+    vods: Mapping[str, str]
+    additional: AdditionalRow
+
+    def as_arguments(
+        self,
+        multipart_streams: Mapping[int, int],
+        color: Callable[[str], str]
+    ) -> Iterable[tuple[str, None | str | Mapping[str, str] | Iterable[str]]]:
+        yield "index", str(self.stream_index)
+        yield "date", self.date
+        last_part = multipart_streams.get(self.stream_index, None)
+        if last_part:
+            yield "part", str(self.part)
+            if last_part == self.part:
+                yield "last_part", "1"
+        yield "game", self.game
+        yield "game_index", str(self.game_index) if self.game_index else None
+        yield "vod", self.vods
+        yield "color", color(self.game)
+        yield from self.additional.as_arguments()
+
+
+# Get an int from a string.
+def numerical(value: str | None) -> int | None:
+    if not value:
+        return None
+    else:
+        try:
+            return int(value, 10)
+        except ValueError:
+            stripped = value.strip("?! ~")
+            if stripped != value:
+                return numerical(stripped)
+            else:
+                raise
+
+
+# Read CSV data in and create a map in a standard format for it.
+def read_and_standardise(
+    file: IO,
+    skip_rows: int,
+    replacements: Mapping[str, str],
+    additional_stream_data: Mapping[int, AdditionalRow],
+) -> Iterable[Row]:
     reader = csv.reader(file, delimiter=",")
     previous_index, previous_date = None, None
     part = 1
@@ -125,36 +190,65 @@ def read_and_standardise(file, skip_rows, replacements, additional_stream_data):
             continue
 
         vods = {
-            **wikify_link("with_chat", vod_with_chat),
-            **wikify_link("without_chat", vod_without_chat),
+            **ensure_link_protocol("with_chat", vod_with_chat),
+            **ensure_link_protocol("without_chat", vod_without_chat),
         }
 
-        current_index = int(index) if index else previous_index
+        current_index = int(index, 10) if index else previous_index
         current_date = date if date else previous_date
         part = part + 1 if not index else 1
+
+        # Skip if we don't have core details still.
+        if current_index is None or current_date is None:
+            continue
 
         # Skip joke Signalis entries.
         if current_index < 300 and game == "Signalis":
             continue
 
-        additional = additional_stream_data.get(str(current_index), {})
+        additional = additional_stream_data.get(
+            current_index,
+            empty_additional_stream_row
+        )
 
-        yield {
-            "index": current_index,
-            "date": datetime.strptime(current_date, "%a, %m/%d/%Y").strftime(
+        yield Row(
+            current_index,
+            datetime.strptime(current_date, "%a, %m/%d/%Y").strftime(
                 "%Y-%m-%d"
             ),
-            "part": part,
-            "game": canonicalise(replacements, game),
-            "game_index": game_index,
-            "vod": vods,
-            **additional,
-        }
+            part,
+            canonicalise(replacements, game),
+            numerical(game_index),
+            vods,
+            additional
+        )
 
         previous_index, previous_date = current_index, current_date
 
 
-def as_template_argument(key, value):
+# A hash that should produce the same number for a string each time.
+def stable_hash(key: str) -> int:
+    hash = hashlib.md5(bytes(key, "UTF-8"), usedforsecurity=False)
+    return int.from_bytes(hash.digest(), signed=False)
+
+
+# Get a color using the hash of the string, giving the same color each time as
+# long as the length of the color list doesn't change.
+def color_picker(colors: Sequence[str]) -> Callable[[str], str]:
+    max = len(colors)
+
+    def color_for_name(name: str) -> str:
+        return colors[stable_hash(name) % max]
+
+    return color_for_name
+
+
+# Turn the value into template arguments, if there are multiple, indexing
+# them (for lists) or suffixing them (for maps).
+def as_template_argument(
+    key: str,
+    value: str | Mapping[str, str] | Iterable[str]
+) -> Iterable[str]:
     if isinstance(value, Mapping):
         for subkey, subvalue in value.items():
             yield f"{key}_{subkey}={subvalue}"
@@ -166,19 +260,12 @@ def as_template_argument(key, value):
         yield f"{key}={value}"
 
 
-def color_picker(colors):
-    max = len(colors)
 
-    def color_for_name(name):
-        return colors[hash(name) % max]
-
-    return color_for_name
-
-
+# Generate wikitext given the standardised rows from the CSV.
 def generate_wiki_source(
-    data_source_id,
-    rows,
-    colors,
+    data_source_id: str,
+    rows: Sequence[Row],
+    colors: Sequence[str],
 ):
     data_source_url = f"https://docs.google.com/spreadsheets/d/{data_source_id}"
     data_attribution = (
@@ -192,11 +279,10 @@ def generate_wiki_source(
     )
     attributions = ", ".join([data_attribution, script_attribution])
 
-    multipart = {row["index"] for row in rows if row["part"] > 1}
+    multipart_streams = {row.stream_index for row in rows if row.part > 1 }
+    last_parts = { index: max(row.part for row in rows if row.stream_index == index) for index in multipart_streams }
 
     color_for_name = color_picker(colors)
-
-    games = {row["game"]: color_for_name(row["game"]) for row in rows}
 
     yield START_MARKER
     yield from WARNING
@@ -207,28 +293,15 @@ def generate_wiki_source(
     yield "! # !! Date !! Game !! No. in Series !! Available VODs"
     yield ""
 
-    previous_index = None
     for row in reversed(rows):
-        index = row["index"]
-        template_args = {
-            **row,
-            "color": games[row["game"]],
-        }
-        # Only include the part if it's not a single game stream.
-        if index not in multipart:
-            del template_args["part"]
-        else:
-            if not previous_index == index:
-                template_args["last_part"] = 1
         arguments = "|".join(
             itertools.chain.from_iterable(
                 as_template_argument(key, value)
-                for (key, value) in template_args.items()
+                for (key, value) in row.as_arguments(last_parts, color_for_name)
                 if value
             )
         )
         yield f"  {{{{StreamIndexEntry|{arguments}}}}}"
-        previous_index = index
 
     yield "|}"
     yield "</div>"
@@ -236,10 +309,13 @@ def generate_wiki_source(
     yield END_MARKER
 
 
+# Open, only allowing overwriting if the given argument is provided.
 @contextmanager
-def open_overwrite(file, arguments, overwrite_arg_name):
+def open_overwrite(
+    filename: str, arguments: Mapping[str, str], overwrite_arg_name: str
+):
     try:
-        yield open(file, "w" if arguments[overwrite_arg_name] else "x")
+        yield open(filename, "w" if arguments[overwrite_arg_name] else "x")
     except FileExistsError:
         print(
             f"Error: The file “{file}” already exists, use the "
@@ -249,7 +325,8 @@ def open_overwrite(file, arguments, overwrite_arg_name):
         sys.exit(2)
 
 
-def open_json(arguments, file_arg_name):
+# Open and read as JSON.
+def open_json(arguments: Mapping[str, str], file_arg_name: str):
     filename = arguments[file_arg_name]
     try:
         with open(filename, "r") as file:
@@ -264,8 +341,16 @@ def open_json(arguments, file_arg_name):
         sys.exit(2)
 
 
+# Update the wiki page on the wiki.
 def update_wiki_page(
-    name, user, password, page_name, wiki_text, reason, dry_run, quiet
+    name: str,
+    user: str,
+    password: str,
+    page_name: str,
+    wiki_text: str,
+    reason: str,
+    dry_run: bool,
+    quiet: bool,
 ):
     from pwiki.wiki import Wiki
 
@@ -273,7 +358,7 @@ def update_wiki_page(
         "wiki.jads.stream",
         f"{user}@{name}",
         password,
-        None,
+        None, #type: ignore # Bad types on the lib.
         "https://wiki.jads.stream/api.php",
     )
 
@@ -309,15 +394,18 @@ if __name__ == "__main__":
 
     arguments = docopt(__doc__)
 
-    download = arguments["--download"]
-    input_file = arguments["--input"]
-    data_source_id = arguments["--spreadsheet-id"]
-    output_file = arguments["--output"]
-    update_wiki = arguments["--update-wiki"]
+    download: bool = arguments["--download"]
+    input_file: str = arguments["--input"]
+    data_source_id: str = arguments["--spreadsheet-id"]
+    output_file: str = arguments["--output"]
+    update_wiki: bool = arguments["--update-wiki"]
 
-    replacements = open_json(arguments, "--replacements")
-    colors = open_json(arguments, "--colors")
-    additional_stream_data = open_json(arguments, "--additional")
+    replacements: Mapping[str, str] = open_json(arguments, "--replacements")
+    colors: Sequence[str] = open_json(arguments, "--colors")
+    additional_stream_data_json = open_json(arguments, "--additional")
+    additional_stream_data = { int(key, 10): AdditionalRow(**value)
+        for (key, value) in additional_stream_data_json.items()
+    }
 
     quiet = arguments["--quiet"] or output_file == "-"
 
@@ -359,10 +447,29 @@ if __name__ == "__main__":
             file.write(f"{wikitext}\n")
 
     if update_wiki:
+        user: str | None = (
+            arguments["--bot-user"] or
+            os.environ.get("MEDIAWIKI_BOT_USER", None)
+        )
+        password: str | None = (
+            arguments["--bot-password"] or
+            os.environ.get("MEDIAWIKI_BOT_PASSWORD", None)
+        )
+
+        if user is None or password is None:
+            print(
+                "To update the wiki page a user and password must be given for the"
+                "bot, set the “--bot-user” and “--bot-password” options or the "
+                "“MEDIAWIKI_BOT_USER” and “MEDIAWIKI_BOT_PASSWORD” environment "
+                "variables.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
         update_wiki_page(
             arguments["--bot-name"],
-            arguments["--bot-user"] or os.environ.get("MEDIAWIKI_BOT_USER"),
-            arguments["--bot-password"] or os.environ.get("MEDIAWIKI_BOT_PASSWORD"),
+            user,
+            password,
             "Stream Index",
             wikitext,
             os.environ.get("UPDATE_REASON", "the script was manually run"),

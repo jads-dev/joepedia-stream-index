@@ -1,3 +1,7 @@
 [project]
 name = "joepedia-stream-index"
 requires-python = ">= 3.8"
+
+[tool.pyright]
+venvPath = "."
+venv = "venv"
