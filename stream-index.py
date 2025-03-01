@@ -61,6 +61,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import IO
 
+
 # Where this script can be found.
 SCRIPT = "https://github.com/jads-dev/joepedia-stream-index"
 
@@ -80,24 +81,18 @@ START_MARKER = "<!-- START GENERATED STREAM INDEX TABLE -->"
 END_MARKER = "<!-- END GENERATED STREAM INDEX TABLE -->"
 
 
-# Add a protocol to a link if it is missing, and put it under the given key.
-def ensure_link_protocol(key: str, link: str):
-    return (
-        {key: link if link.startswith("https://") else f"https://{link}"}
-        if link
-        else {}
-    )
-
+# Add a protocol to a link if it is missing.
+def ensure_link_protocol(link: str) -> str:
+    return link if link.startswith("https://") else f"https://{link}"
 
 # Apply replacements to a string to ensure it uses canonical names.
-def canonicalise(replacements: Mapping[str, str], value: str):
+def canonicalise(replacements: Mapping[str, str], value: str) -> str:
     for target, replacement in replacements.items():
         value = value.replace(target, replacement)
     return value
 
-
 # Obtain spreadsheet data using the google drive API.
-def obtain(file_id: str, api_key: str | None):
+def obtain(file_id: str, api_key: str | None) -> str:
     from googleapiclient.discovery import build
 
     with build("drive", "v3", developerKey=api_key) as drive:
@@ -164,10 +159,14 @@ def numerical(value: str | None) -> int | None:
 # Read CSV data in and create a map in a standard format for it.
 def read_and_standardise(
     file: IO,
-    skip_rows: int,
-    replacements: Mapping[str, str],
-    additional_stream_data: Mapping[int, AdditionalRow],
+    skip_rows: int = 0,
+    replacements: Mapping[str, str] | None = None,
+    additional_stream_data: Mapping[int, AdditionalRow] | None = None,
 ) -> Iterable[Row]:
+    if replacements is None:
+        replacements = {}
+    if additional_stream_data is None:
+        additional_stream_data = {}
     reader = csv.reader(file, delimiter=",")
     previous_index, previous_date = None, None
     part = 1
@@ -189,10 +188,10 @@ def read_and_standardise(
         if (not index and date) or other_date == "(Today)":
             continue
 
-        vods = {
-            **ensure_link_protocol("with_chat", vod_with_chat),
-            **ensure_link_protocol("without_chat", vod_without_chat),
-        }
+        vods = {key: ensure_link_protocol(value) for (key, value) in [
+            ("with_chat", vod_with_chat),
+            ("without_chat", vod_without_chat),
+        ] if value}
 
         current_index = int(index, 10) if index else previous_index
         current_date = date if date else previous_date
@@ -381,7 +380,7 @@ def update_wiki_page(
             print(f"{name}: Dry run, not actually updating, would have edited to:")
             print(new_text)
         else:
-            wiki.edit(page_name, new_text, summary)
+            wiki.edit(page_name, new_text, summary) #type: ignore # Bad types on the lib.
             if not quiet:
                 print(summary)
     else:
@@ -406,13 +405,13 @@ if __name__ == "__main__":
     additional_stream_data = { int(key, 10): AdditionalRow(**value)
         for (key, value) in additional_stream_data_json.items()
     }
+    api_key = arguments["--google-api-key"] or os.environ.get(
+       "GOOGLE_API_KEY", None
+    )
 
     quiet = arguments["--quiet"] or output_file == "-"
 
     if download:
-        api_key = arguments["--google-api-key"] or os.environ.get(
-            "GOOGLE_API_KEY", None
-        )
         if not api_key:
             print(
                 "An API key must be provided with either “--google-api-key” or "
