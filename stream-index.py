@@ -38,17 +38,21 @@ Uncommon Options:
                          from. [default: additional_stream_data.json]
     --dry-run            Don't actually update the wiki, just show the output
                          for testing.
-    --bot-name NAME      The name of the bot for updating
+    --local-json         Get JSON files from the local filesystem rather than
+                         the wiki.
+    --bot-name NAME      The name of the bot for accessing and updating
                          mediawiki. [default: joepedia-stream-index-bot]
-    --bot-user USER      The user providing the bot password for updating
-                         mediawiki, if not set the value of the
+    --bot-user USER      The user providing the bot password for accessing
+                         and updating mediawiki, if not set the value of the
                          MEDIAWIKI_BOT_USER environment variable will be used.
-    --bot-password PASS  The bot password for updating mediawiki, if not set
-                         the value of the MEDIAWIKI_BOT_PASSWORD environment
-                         variable will be used.
+    --bot-password PASS  The bot password for accessing and updating mediawiki,
+                         if not set the value of the MEDIAWIKI_BOT_PASSWORD
+                         environment variable will be used.
 
 """
 
+from __future__ import annotations
+from typing import TYPE_CHECKING
 import csv
 import hashlib
 import itertools
@@ -61,6 +65,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import IO
 
+if TYPE_CHECKING:
+    from pwiki.wiki import Wiki
 
 # Where this script can be found.
 SCRIPT = "https://github.com/jads-dev/joepedia-stream-index"
@@ -79,6 +85,39 @@ WARNING = [
 # Markers that are used to find and replace the table in the wiki page.
 START_MARKER = "<!-- START GENERATED STREAM INDEX TABLE -->"
 END_MARKER = "<!-- END GENERATED STREAM INDEX TABLE -->"
+
+
+# Authentication for a wiki.
+@dataclass
+class WikiAuth:
+    name: str
+    user: str
+    password: str
+
+
+# A lazy loader for wiki access.
+# This assumes name/password don't change.
+class LazyWiki:
+    wiki: Wiki | None
+
+    def __init__(self):
+        self.wiki = None
+
+    def load(self, auth: WikiAuth) -> Wiki:
+        if self.wiki is not None:
+            return self.wiki
+        else:
+            from pwiki.wiki import Wiki
+            self.wiki = Wiki(
+                "wiki.jads.stream",
+                f"{auth.user}@{auth.name}",
+                auth.password,
+                None, #type: ignore # Bad types on the lib.
+                "https://wiki.jads.stream/api.php",
+            )
+            return self.wiki
+
+lazy_wiki = LazyWiki()
 
 
 # Add a protocol to a link if it is missing.
@@ -325,41 +364,63 @@ def open_overwrite(
 
 
 # Open and read as JSON.
-def open_json(arguments: Mapping[str, str], file_arg_name: str):
+def open_json(
+    arguments: Mapping[str, str],
+    file_arg_name: str,
+    page_name: str,
+    auth: WikiAuth | None = None,
+    local_json: bool = False,
+):
     filename = arguments[file_arg_name]
-    try:
-        with open(filename, "r") as file:
-            return json.load(file)
-    except FileNotFoundError:
-        print(
-            f"Error: The file “{filename}” does not exists, use the "
-            f"“{file_arg_name}” argument if you wish to change what file to "
-            "use.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+    if auth is None:
+        try:
+            with open(filename, "r") as file:
+                return json.load(file)
+        except FileNotFoundError:
+            print(
+                f"Error: The file “{filename}” does not exists, use the "
+                f"“{file_arg_name}” argument if you wish to change what file to "
+                "use, or don't use --local-json to look on the wiki.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    else:
+        if auth is None:
+            print(
+                "To access wiki pages a user and password must be given for "
+                "the bot, set the “--bot-user” and “--bot-password” options or "
+                "the “MEDIAWIKI_BOT_USER” and “MEDIAWIKI_BOT_PASSWORD” "
+                "environment variables, or --local-json to look for local "
+                "files rather than on the wiki.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        wiki = lazy_wiki.load(auth)
+        file_page_name = f"{page_name}/{filename}"
+        raw_json = wiki.page_text(file_page_name)
+        if raw_json is None:
+            print(
+                f"Error: The wiki page “{file_page_name}” does not exists, use "
+                f"the “{file_arg_name}” argument if you wish to change what "
+                "page to use, or --local-json to look for local files rather "
+                "than on the wiki.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        else:
+            return json.loads(raw_json)
 
 
 # Update the wiki page on the wiki.
 def update_wiki_page(
-    name: str,
-    user: str,
-    password: str,
+    auth: WikiAuth,
     page_name: str,
     wiki_text: str,
     reason: str,
     dry_run: bool,
     quiet: bool,
 ):
-    from pwiki.wiki import Wiki
-
-    wiki = Wiki(
-        "wiki.jads.stream",
-        f"{user}@{name}",
-        password,
-        None, #type: ignore # Bad types on the lib.
-        "https://wiki.jads.stream/api.php",
-    )
+    wiki = lazy_wiki.load(auth)
 
     old_text = wiki.page_text(page_name)
     before, start_marker, rest = old_text.partition(START_MARKER)
@@ -375,9 +436,9 @@ def update_wiki_page(
     new_text = f"{before}{wiki_text}{after}"
 
     if old_text != new_text:
-        summary = f"{name}: Updated because {reason}."
+        summary = f"{auth.name}: Updated because {reason}."
         if dry_run:
-            print(f"{name}: Dry run, not actually updating, would have edited to:")
+            print(f"{auth.name}: Dry run, not actually updating, would have edited to:")
             print(new_text)
         else:
             wiki.edit(page_name, new_text, summary) #type: ignore # Bad types on the lib.
@@ -385,7 +446,7 @@ def update_wiki_page(
                 print(summary)
     else:
         if not quiet:
-            print(f"{name}: Update tried because {reason}, but no changes needed.")
+            print(f"{auth.name}: Update tried because {reason}, but no changes needed.")
 
 
 if __name__ == "__main__":
@@ -393,15 +454,33 @@ if __name__ == "__main__":
 
     arguments = docopt(__doc__)
 
+    page_name = "Stream Index"
+
     download: bool = arguments["--download"]
     input_file: str = arguments["--input"]
     data_source_id: str = arguments["--spreadsheet-id"]
     output_file: str = arguments["--output"]
     update_wiki: bool = arguments["--update-wiki"]
+    local_json: bool = arguments["--local-json"]
 
-    replacements: Mapping[str, str] = open_json(arguments, "--replacements")
-    colors: Sequence[str] = open_json(arguments, "--colors")
-    additional_stream_data_json = open_json(arguments, "--additional")
+    user: str | None = (
+        arguments["--bot-user"] or
+        os.environ.get("MEDIAWIKI_BOT_USER", None)
+    )
+    password: str | None = (
+        arguments["--bot-password"] or
+        os.environ.get("MEDIAWIKI_BOT_PASSWORD", None)
+    )
+
+    auth: WikiAuth | None = None if user is None or password is None else WikiAuth(
+        arguments["--bot-name"],
+        user,
+        password,
+    )
+
+    replacements: Mapping[str, str] = open_json(arguments, "--replacements", page_name, auth, local_json)
+    colors: Sequence[str] = open_json(arguments, "--colors", page_name, auth, local_json)
+    additional_stream_data_json = open_json(arguments, "--additional", page_name, auth, local_json)
     additional_stream_data = { int(key, 10): AdditionalRow(**value)
         for (key, value) in additional_stream_data_json.items()
     }
@@ -446,30 +525,19 @@ if __name__ == "__main__":
             file.write(f"{wikitext}\n")
 
     if update_wiki:
-        user: str | None = (
-            arguments["--bot-user"] or
-            os.environ.get("MEDIAWIKI_BOT_USER", None)
-        )
-        password: str | None = (
-            arguments["--bot-password"] or
-            os.environ.get("MEDIAWIKI_BOT_PASSWORD", None)
-        )
-
-        if user is None or password is None:
+        if auth is None:
             print(
-                "To update the wiki page a user and password must be given for the"
-                "bot, set the “--bot-user” and “--bot-password” options or the "
-                "“MEDIAWIKI_BOT_USER” and “MEDIAWIKI_BOT_PASSWORD” environment "
-                "variables.",
+                "To update the wiki page a user and password must be given for "
+                "the bot, set the “--bot-user” and “--bot-password” options or "
+                "the “MEDIAWIKI_BOT_USER” and “MEDIAWIKI_BOT_PASSWORD” "
+                "environment variables.",
                 file=sys.stderr,
             )
             sys.exit(2)
 
         update_wiki_page(
-            arguments["--bot-name"],
-            user,
-            password,
-            "Stream Index",
+            auth,
+            page_name,
             wikitext,
             os.environ.get("UPDATE_REASON", "the script was manually run"),
             arguments["--dry-run"],
