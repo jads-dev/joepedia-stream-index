@@ -216,6 +216,7 @@ def read_and_standardise(
             other_date,
             game,
             game_index,
+            _,
             vod_with_chat,
             _,
             _,
@@ -249,7 +250,7 @@ def read_and_standardise(
             empty_additional_stream_row
         )
 
-        yield Row(
+        row = Row(
             current_index,
             datetime.strptime(current_date, "%a, %m/%d/%Y").strftime(
                 "%Y-%m-%d"
@@ -260,6 +261,11 @@ def read_and_standardise(
             vods,
             additional
         )
+
+        if row.game_index is not None and row.game_index > 21 and row.game == "Umineko When They Cry - Question Arcs":
+            row.game = "Umineko When They Cry - Answer Arcs"
+
+        yield row
 
         previous_index, previous_date = current_index, current_date
 
