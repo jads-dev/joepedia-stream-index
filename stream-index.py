@@ -210,64 +210,72 @@ def read_and_standardise(
     previous_index, previous_date = None, None
     part = 1
     for row in itertools.islice(reader, skip_rows + 1, None):
-        [
-            index,
-            date,
-            other_date,
-            game,
-            game_index,
-            _,
-            vod_with_chat,
-            _,
-            _,
-            vod_without_chat,
-            *_,
-        ] = row
+        try:
+            [
+                index,
+                date,
+                other_date,
+                game,
+                game_index,
+                _,
+                vod_with_chat,
+                _,
+                _,
+                vod_without_chat,
+                *_,
+            ] = row
 
-        # Skip graph at the end.
-        if (not index and date) or other_date == "(Today)":
-            continue
+            # Skip graph at the end.
+            if (not index and date) or game == "(Today)":
+                continue
 
-        vods = {key: ensure_link_protocol(value) for (key, value) in [
-            ("with_chat", vod_with_chat),
-            ("without_chat", vod_without_chat),
-        ] if value}
+            vods = {key: ensure_link_protocol(value) for (key, value) in [
+                ("with_chat", vod_with_chat),
+                ("without_chat", vod_without_chat),
+            ] if value}
 
-        current_index = int(index, 10) if index else previous_index
-        current_date = date if date else previous_date
-        part = part + 1 if not index else 1
+            current_index = int(index, 10) if index else previous_index
+            current_date = date if date else previous_date
+            part = part + 1 if not index else 1
 
-        # Skip if we don't have core details still.
-        if current_index is None or current_date is None:
-            continue
+            # Skip if we don't have core details still.
+            if current_index is None or current_date is None:
+                continue
 
-        # Skip joke Signalis entries.
-        if current_index < 300 and game == "Signalis":
-            continue
+            # Skip joke Signalis entries.
+            if current_index < 300 and game == "Signalis":
+                continue
 
-        additional = additional_stream_data.get(
-            current_index,
-            empty_additional_stream_row
-        )
+            additional = additional_stream_data.get(
+                current_index,
+                empty_additional_stream_row
+            )
 
-        row = Row(
-            current_index,
-            datetime.strptime(current_date, "%a, %m/%d/%Y").strftime(
-                "%Y-%m-%d"
-            ),
-            part,
-            canonicalise(replacements, game),
-            numerical(game_index),
-            vods,
-            additional
-        )
+            row = Row(
+                current_index,
+                datetime.strptime(current_date, "%a, %m/%d/%Y").strftime(
+                    "%Y-%m-%d"
+                ),
+                part,
+                canonicalise(replacements, game),
+                numerical(game_index),
+                vods,
+                additional
+            )
 
-        if row.game_index is not None and row.game_index > 21 and row.game == "Umineko When They Cry - Question Arcs":
-            row.game = "Umineko When They Cry - Answer Arcs"
+            if row.game_index is not None and row.game_index > 21 and row.game == "Umineko When They Cry - Question Arcs":
+                row.game = "Umineko When They Cry - Answer Arcs"
 
-        yield row
+            yield row
 
-        previous_index, previous_date = current_index, current_date
+            previous_index, previous_date = current_index, current_date
+        except Exception:
+            print(
+                f"Error: could not parse row: {row}",
+                file=sys.stderr,
+            )
+            raise
+
 
 
 # A hash that should produce the same number for a string each time.

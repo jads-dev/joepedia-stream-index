@@ -15,17 +15,22 @@ jobs:
       - name: Checkout repository.
         uses: actions/checkout@v3
 
-      - name: Configure Python.
+      - name: "Set up Python"
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-          cache: "pip"
+          python-version-file: "pyproject.toml"
 
-      - name: Install Python dependencies.
-        run: pip install -r requirements.txt
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.13"
+          enable-cache: true
+
+      - name: Install the project
+        run: uv sync --locked --all-extras --dev
 
       - name: Generate wikitext.
-        run: python stream-index.py -d -u
+        run: uv run stream-index.py -d -u
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           MEDIAWIKI_BOT_USER: ${{ secrets.MEDIAWIKI_BOT_USER }}
