@@ -2,3 +2,4 @@
 stream-index.txt
 .ropeproject
 venv
+.env

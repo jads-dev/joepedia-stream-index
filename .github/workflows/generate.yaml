@@ -30,11 +30,13 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Generate wikitext.
-        run: uv run stream-index.py -d -u
+        run: uv run stream-index.py -d -u -l
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           MEDIAWIKI_BOT_USER: ${{ secrets.MEDIAWIKI_BOT_USER }}
           MEDIAWIKI_BOT_PASSWORD: ${{ secrets.MEDIAWIKI_BOT_PASSWORD }}
+          IGDB_ID: ${{ secrets.IGDB_ID }}
+          IGDB_SECRET: ${{ secrets.IGDB_SECRET }}
           UPDATE_REASON: ${{ github.event_name == 'push' && 'the script was updated' || 'of a scheduled update' }}
 
       - name: Upload generated wikitext.

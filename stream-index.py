@@ -20,6 +20,9 @@ Options:
                          Requires the pwiki library is installed.
     -q --quiet           Doesn't give output unless there is a problem, this
                          is implied if you output to stdout.
+    -l --lookup          Try to look up game data from IGDB, requires a client
+                         ID and secret are set and rauth and igdb-api-v4
+                         libraries are installed.
 
 Uncommon Options:
     --google-api-key     The API key when downloading from google, if not
@@ -36,6 +39,8 @@ Uncommon Options:
                          [default: replacements.json]
     --additional FILE    The JSON file to load a list of additional stream data
                          from. [default: additional_stream_data.json]
+    --game-slugs FILE    The JSON file to load a mapping of game names to IGDB
+                         slugs from. [default: slugs.json]
     --dry-run            Don't actually update the wiki, just show the output
                          for testing.
     --local-json         Get JSON files from the local filesystem rather than
@@ -48,11 +53,14 @@ Uncommon Options:
     --bot-password PASS  The bot password for accessing and updating mediawiki,
                          if not set the value of the MEDIAWIKI_BOT_PASSWORD
                          environment variable will be used.
-
+    --igdb-id ID         The client ID for IGDB's API, if not set the value of
+                         the IGDB_ID environment variable will be used.
+    --igdb-secret SECRET The secret for IGDB's API, if not set the value of the
+                         IGDB_SECRET environment variable will be used.
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 import csv
 import hashlib
 import itertools
@@ -64,9 +72,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import IO
+from dotenv import load_dotenv
+
+load_dotenv()
 
 if TYPE_CHECKING:
     from pwiki.wiki import Wiki
+    from igdb.wrapper import IGDBWrapper
 
 # Where this script can be found.
 SCRIPT = "https://github.com/jads-dev/joepedia-stream-index"
@@ -108,27 +120,96 @@ class LazyWiki:
             return self.wiki
         else:
             from pwiki.wiki import Wiki
+
             self.wiki = Wiki(
                 "wiki.jads.stream",
                 f"{auth.user}@{auth.name}",
                 auth.password,
-                None, #type: ignore # Bad types on the lib.
+                None,  # type: ignore # Bad types on the lib.
                 "https://wiki.jads.stream/api.php",
             )
             return self.wiki
 
+
 lazy_wiki = LazyWiki()
+
+
+class GameResolver:
+    igdb: Optional[IGDBWrapper] = None
+    cache: Mapping[str, str]
+
+    def __init__(self, slugs, auth: Optional[Tuple[str, str]] = None):
+        self.cache = slugs
+        if auth is not None:
+            from igdb.wrapper import IGDBWrapper
+            from rauth import OAuth2Service
+
+            (id, secret) = auth
+            twitch = OAuth2Service(
+                client_id=id,
+                client_secret=secret,
+                name="twitch",
+                authorize_url="https://id.twitch.tv/oauth2/authorize",
+                access_token_url="https://id.twitch.tv/oauth2/token",
+                base_url="https://id.twitch.tv/",
+            )
+            accessToken = twitch.get_access_token(
+                decoder=json.loads, data={"grant_type": "client_credentials"}
+            )
+            self.igdb = IGDBWrapper(id, accessToken)
+        else:
+            self.igdb = None
+
+    def _lookup(self, game_name: str) -> str | None:
+        if self.igdb:
+            from igdb.igdbapi_pb2 import GameResult
+
+            response = self.igdb.api_request(
+                "games.pb", f'fields slug, name; limit 1; search "{game_name}";'
+            )
+            result = GameResult()
+            result.ParseFromString(response)
+            if len(result.games) > 0:
+                [game] = result.games
+                print(
+                    f"Matched “{game_name}” to “{game.slug}”.",
+                    file=sys.stderr,
+                )
+                return game.slug
+            else:
+                print(
+                    f"Could not find a game on IGDB to match “{game_name}”.",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"No slug available for “{game_name}”.",
+                file=sys.stderr,
+            )
+        return None
+
+    def lookup(self, game_name: str) -> str | None:
+        # Value can intentionally be null so we check the key not the value.
+        if game_name in self.cache:
+            cached = self.cache.get(game_name)
+            return cached
+        else:
+            result = self._lookup(game_name)
+            self.cache[game_name] = result
+            return result
 
 
 # Add a protocol to a link if it is missing.
 def ensure_link_protocol(link: str) -> str:
     return link if link.startswith("https://") else f"https://{link}"
 
+
 # Apply replacements to a string to ensure it uses canonical names.
 def canonicalise(replacements: Mapping[str, str], value: str) -> str:
     for target, replacement in replacements.items():
         value = value.replace(target, replacement)
     return value
+
 
 # Obtain spreadsheet data using the google drive API.
 def obtain(file_id: str, api_key: str | None) -> str:
@@ -142,14 +223,19 @@ def obtain(file_id: str, api_key: str | None) -> str:
         else:
             return data.decode("utf-8")
 
+
 @dataclass
 class AdditionalRow:
     guest: Sequence[str]
 
-    def as_arguments(self) -> Iterable[tuple[str, None | str | Mapping[str, str] | Iterable[str]]]:
+    def as_arguments(
+        self,
+    ) -> Iterable[tuple[str, None | str | Mapping[str, str] | Iterable[str]]]:
         yield "guest", self.guest
 
+
 empty_additional_stream_row = AdditionalRow([])
+
 
 @dataclass
 class Row:
@@ -157,14 +243,13 @@ class Row:
     date: str
     part: int
     game: str
+    igdb_slug: str | None
     game_index: int | None
     vods: Mapping[str, str]
     additional: AdditionalRow
 
     def as_arguments(
-        self,
-        multipart_streams: Mapping[int, int],
-        color: Callable[[str], str]
+        self, multipart_streams: Mapping[int, int], color: Callable[[str], str]
     ) -> Iterable[tuple[str, None | str | Mapping[str, str] | Iterable[str]]]:
         yield "index", str(self.stream_index)
         yield "date", self.date
@@ -174,6 +259,7 @@ class Row:
             if last_part == self.part:
                 yield "last_part", "1"
         yield "game", self.game
+        yield "igdb_slug", self.igdb_slug
         yield "game_index", str(self.game_index) if self.game_index else None
         yield "vod", self.vods
         yield "color", color(self.game)
@@ -198,6 +284,7 @@ def numerical(value: str | None) -> int | None:
 # Read CSV data in and create a map in a standard format for it.
 def read_and_standardise(
     file: IO,
+    gameResolver: GameResolver,
     skip_rows: int = 0,
     replacements: Mapping[str, str] | None = None,
     additional_stream_data: Mapping[int, AdditionalRow] | None = None,
@@ -229,10 +316,14 @@ def read_and_standardise(
             if (not index and date) or game == "(Today)":
                 continue
 
-            vods = {key: ensure_link_protocol(value) for (key, value) in [
-                ("with_chat", vod_with_chat),
-                ("without_chat", vod_without_chat),
-            ] if value}
+            vods = {
+                key: ensure_link_protocol(value)
+                for (key, value) in [
+                    ("with_chat", vod_with_chat),
+                    ("without_chat", vod_without_chat),
+                ]
+                if value
+            }
 
             current_index = int(index, 10) if index else previous_index
             current_date = date if date else previous_date
@@ -247,24 +338,28 @@ def read_and_standardise(
                 continue
 
             additional = additional_stream_data.get(
-                current_index,
-                empty_additional_stream_row
+                current_index, empty_additional_stream_row
             )
 
             row = Row(
                 current_index,
-                datetime.strptime(current_date, "%a, %m/%d/%Y").strftime(
-                    "%Y-%m-%d"
-                ),
+                datetime.strptime(current_date, "%a, %m/%d/%Y").strftime("%Y-%m-%d"),
                 part,
                 canonicalise(replacements, game),
+                None,
                 numerical(game_index),
                 vods,
-                additional
+                additional,
             )
 
-            if row.game_index is not None and row.game_index > 21 and row.game == "Umineko When They Cry - Question Arcs":
+            if (
+                row.game_index is not None
+                and row.game_index > 21
+                and row.game == "Umineko When They Cry - Question Arcs"
+            ):
                 row.game = "Umineko When They Cry - Answer Arcs"
+
+            row.igdb_slug = gameResolver.lookup(row.game)
 
             yield row
 
@@ -275,7 +370,6 @@ def read_and_standardise(
                 file=sys.stderr,
             )
             raise
-
 
 
 # A hash that should produce the same number for a string each time.
@@ -298,8 +392,7 @@ def color_picker(colors: Sequence[str]) -> Callable[[str], str]:
 # Turn the value into template arguments, if there are multiple, indexing
 # them (for lists) or suffixing them (for maps).
 def as_template_argument(
-    key: str,
-    value: str | Mapping[str, str] | Iterable[str]
+    key: str, value: str | Mapping[str, str] | Iterable[str]
 ) -> Iterable[str]:
     if isinstance(value, Mapping):
         for subkey, subvalue in value.items():
@@ -310,7 +403,6 @@ def as_template_argument(
             yield f"{key}{index_str}={subvalue}"
     else:
         yield f"{key}={value}"
-
 
 
 # Generate wikitext given the standardised rows from the CSV.
@@ -331,8 +423,11 @@ def generate_wiki_source(
     )
     attributions = ", ".join([data_attribution, script_attribution])
 
-    multipart_streams = {row.stream_index for row in rows if row.part > 1 }
-    last_parts = { index: max(row.part for row in rows if row.stream_index == index) for index in multipart_streams }
+    multipart_streams = {row.stream_index for row in rows if row.part > 1}
+    last_parts = {
+        index: max(row.part for row in rows if row.stream_index == index)
+        for index in multipart_streams
+    }
 
     color_for_name = color_picker(colors)
 
@@ -455,7 +550,7 @@ def update_wiki_page(
             print(f"{auth.name}: Dry run, not actually updating, would have edited to:")
             print(new_text)
         else:
-            wiki.edit(page_name, new_text, summary) #type: ignore # Bad types on the lib.
+            wiki.edit(page_name, new_text, summary)  # type: ignore # Bad types on the lib.
             if not quiet:
                 print(summary)
     else:
@@ -476,31 +571,53 @@ if __name__ == "__main__":
     output_file: str = arguments["--output"]
     update_wiki: bool = arguments["--update-wiki"]
     local_json: bool = arguments["--local-json"]
+    lookup: bool = arguments["--lookup"]
 
-    user: str | None = (
-        arguments["--bot-user"] or
-        os.environ.get("MEDIAWIKI_BOT_USER", None)
+    user: str | None = arguments["--bot-user"] or os.environ.get(
+        "MEDIAWIKI_BOT_USER", None
     )
-    password: str | None = (
-        arguments["--bot-password"] or
-        os.environ.get("MEDIAWIKI_BOT_PASSWORD", None)
-    )
-
-    auth: WikiAuth | None = None if user is None or password is None else WikiAuth(
-        arguments["--bot-name"],
-        user,
-        password,
+    password: str | None = arguments["--bot-password"] or os.environ.get(
+        "MEDIAWIKI_BOT_PASSWORD", None
     )
 
-    replacements: Mapping[str, str] = open_json(arguments, "--replacements", page_name, auth, local_json)
-    colors: Sequence[str] = open_json(arguments, "--colors", page_name, auth, local_json)
-    additional_stream_data_json = open_json(arguments, "--additional", page_name, auth, local_json)
-    additional_stream_data = { int(key, 10): AdditionalRow(**value)
+    auth: WikiAuth | None = (
+        None
+        if user is None or password is None
+        else WikiAuth(
+            arguments["--bot-name"],
+            user,
+            password,
+        )
+    )
+
+    replacements: Mapping[str, str] = open_json(
+        arguments, "--replacements", page_name, auth, local_json
+    )
+    colors: Sequence[str] = open_json(
+        arguments, "--colors", page_name, auth, local_json
+    )
+    additional_stream_data_json = open_json(
+        arguments, "--additional", page_name, auth, local_json
+    )
+    game_slugs = open_json(arguments, "--game-slugs", page_name, auth, local_json)
+    additional_stream_data = {
+        int(key, 10): AdditionalRow(**value)
         for (key, value) in additional_stream_data_json.items()
     }
-    api_key = arguments["--google-api-key"] or os.environ.get(
-       "GOOGLE_API_KEY", None
-    )
+    api_key = arguments["--google-api-key"] or os.environ.get("GOOGLE_API_KEY", None)
+    igdb_id = arguments["--igdb-id"] or os.environ.get("IGDB_ID", None)
+    igdb_secret = arguments["--igdb-secret"] or os.environ.get("IGDB_SECRET", None)
+
+    if lookup:
+        if not igdb_id or not igdb_secret:
+            print(
+                "An IGDB client id and secret must be provided with either "
+                "“--igdb-id”/“--igdb-secret” or the “IGDB_ID”/“IGDB_SECRET” "
+                "environment variables when lookup is enabled.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    gameResolver = GameResolver(game_slugs, (igdb_id, igdb_secret) if lookup else None)
 
     quiet = arguments["--quiet"] or output_file == "-"
 
@@ -522,6 +639,7 @@ if __name__ == "__main__":
         rows = list(
             read_and_standardise(
                 file,
+                gameResolver,
                 int(arguments["--skip-rows"], base=10),
                 replacements,
                 additional_stream_data,
