@@ -60,7 +60,7 @@ Uncommon Options:
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, Optional, Tuple
+
 import csv
 import hashlib
 import itertools
@@ -71,14 +71,15 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import IO
+from typing import IO, TYPE_CHECKING, Optional, Tuple
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
 if TYPE_CHECKING:
-    from pwiki.wiki import Wiki
     from igdb.wrapper import IGDBWrapper
+    from pwiki.wiki import Wiki
 
 # Where this script can be found.
 SCRIPT = "https://github.com/jads-dev/joepedia-stream-index"
@@ -294,22 +295,22 @@ def read_and_standardise(
     if additional_stream_data is None:
         additional_stream_data = {}
     reader = csv.reader(file, delimiter=",")
-    previous_index, previous_date = None, None
+    previous_index, previous_date, previous_host = None, None, None
     part = 1
     for row in itertools.islice(reader, skip_rows + 1, None):
         try:
             [
                 index,
                 date,
-                other_date,
                 game,
                 game_index,
-                _,
                 vod_with_chat,
-                _,
-                _,
+                vod_abridged,
                 vod_without_chat,
-                *_,
+                with_chat_channel,
+                without_chat_channel,
+                notes,
+                host,
             ] = row
 
             # Skip graph at the end.
@@ -327,6 +328,7 @@ def read_and_standardise(
 
             current_index = int(index, 10) if index else previous_index
             current_date = date if date else previous_date
+            current_host = host if index or host else previous_host
             part = part + 1 if not index else 1
 
             # Skip if we don't have core details still.
@@ -335,6 +337,16 @@ def read_and_standardise(
 
             # Skip joke Signalis entries.
             if current_index < 300 and game == "Signalis":
+                continue
+
+            previous_index, previous_date, previous_host = (
+                current_index,
+                current_date,
+                host,
+            )
+
+            # Skip streams on other people's channels.
+            if current_host:
                 continue
 
             additional = additional_stream_data.get(
@@ -362,8 +374,6 @@ def read_and_standardise(
             row.igdb_slug = gameResolver.lookup(row.game)
 
             yield row
-
-            previous_index, previous_date = current_index, current_date
         except Exception:
             print(
                 f"Error: could not parse row: {row}",
@@ -465,7 +475,7 @@ def open_overwrite(
         yield open(filename, "w" if arguments[overwrite_arg_name] else "x")
     except FileExistsError:
         print(
-            f"Error: The file “{file}” already exists, use the "
+            f"Error: The file “{filename}” already exists, use the "
             f"“{overwrite_arg_name}” argument if you wish to overwrite it.",
             file=sys.stderr,
         )
