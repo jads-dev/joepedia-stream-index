@@ -275,7 +275,7 @@ def numerical(value: str | None) -> int | None:
         try:
             return int(value, 10)
         except ValueError:
-            stripped = value.strip("?! ~")
+            stripped = value.strip("?! ~").replace(",", "")
             if stripped != value:
                 return numerical(stripped)
             else:
@@ -326,7 +326,7 @@ def read_and_standardise(
                 if value
             }
 
-            current_index = int(index, 10) if index else previous_index
+            current_index = numerical(index) if index else previous_index
             current_date = date if date else previous_date
             current_host = host if index or host else previous_host
             part = part + 1 if not index else 1
