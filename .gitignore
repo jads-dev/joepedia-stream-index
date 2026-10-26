@@ -3,3 +3,8 @@ stream-index.txt
 .ropeproject
 venv
 .env
+
+# Pywikibot
+*.lwp
+*.ctrl
+apicache

@@ -14,24 +14,20 @@ jobs:
 
     steps:
       - name: Checkout repository.
-        uses: actions/checkout@v6
-
-      - name: "Set up Python"
-        uses: actions/setup-python@v6
-        with:
-          python-version-file: "pyproject.toml"
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@v10.3.2
         with:
-          version: "0.8.13"
+          version: "0.13.5"
           enable-cache: true
+          python-version: "3.15"
 
       - name: Install the project
-        run: uv sync --locked --all-extras --dev
+        run: uv sync --locked --all-extras
 
       - name: Generate wikitext.
-        run: uv run stream-index.py -d -u -l
+        run: uv run stream-index.py --download --update-wiki --lookup
         env:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           MEDIAWIKI_BOT_USER: ${{ secrets.MEDIAWIKI_BOT_USER }}
